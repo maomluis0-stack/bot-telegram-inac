@@ -1,160 +1,135 @@
-import os
-import sqlite3
-from datetime import datetime, timedelta
-
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
-    MessageHandler,
-    filters
+    ApplicationBuilder, MessageHandler, CommandHandler,
+    ContextTypes, filters
 )
+from datetime import datetime, timedelta
+import sqlite3
+import os
 
-# ===== VARIABLES DE ENTORNO =====
-TOKEN = os.environ.get("BOT_TOKEN")
-APP_URL = os.environ.get("APP_URL")
-PORT = int(os.environ.get("PORT", 8080))
+# TOKEN desde variable de entorno
+TOKEN = os.getenv("TOKEN")
 
-# ===== CONFIGURACIÓN POR DEFECTO =====
-INACTIVO_DIAS_DEFECTO = 14
-NUEVO_DIAS_DEFECTO = 3
+INACTIVITY_DAYS = 14
+NEW_USER_GRACE_DAYS = 3   # usuarios nuevos ignorados
 
-# ===== BASE DE DATOS =====
-db = sqlite3.connect("bot.db", check_same_thread=False)
-cur = db.cursor()
+# ---------- DB ----------
+conn = sqlite3.connect("activity.db", check_same_thread=False)
+cur = conn.cursor()
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER,
     chat_id INTEGER,
+    user_id INTEGER,
     last_activity TEXT,
-    join_date TEXT,
-    PRIMARY KEY (user_id, chat_id)
+    joined_at TEXT,
+    warned INTEGER DEFAULT 0,
+    PRIMARY KEY (chat_id, user_id)
 )
 """)
+conn.commit()
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS config (
-    chat_id INTEGER PRIMARY KEY,
-    inactive_days INTEGER,
-    new_user_days INTEGER
-)
-""")
+# ---------- HELPERS ----------
+def now():
+    return datetime.utcnow()
 
-db.commit()
-
-
-# ===== FUNCIONES =====
-def obtener_config(chat_id):
-    cur.execute("SELECT inactive_days, new_user_days FROM config WHERE chat_id=?", (chat_id,))
-    row = cur.fetchone()
-    if row:
-        return row
-    return INACTIVO_DIAS_DEFECTO, NUEVO_DIAS_DEFECTO
-
-
-async def registrar_actividad(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat = update.effective_chat
-
-    if not user or user.is_bot:
+# ---------- ACTIVITY ----------
+async def register_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.effective_user:
         return
 
-    ahora = datetime.utcnow().isoformat()
-
-    cur.execute("""
-    INSERT INTO users (user_id, chat_id, last_activity, join_date)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(user_id, chat_id)
-    DO UPDATE SET last_activity=?
-    """, (user.id, chat.id, ahora, ahora, ahora))
-
-    db.commit()
-
-
-async def revisar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    ahora = datetime.utcnow()
+    user = update.effective_user
 
-    inactivo_dias, nuevo_dias = obtener_config(chat.id)
-
-    admins = await chat.get_administrators()
-    admins_ids = {a.user.id for a in admins}
-
-    cur.execute("SELECT user_id, last_activity, join_date FROM users WHERE chat_id=?", (chat.id,))
-    usuarios = cur.fetchall()
-
-    avisados = 0
-
-    for user_id, last_activity, join_date in usuarios:
-        if user_id in admins_ids:
-            continue
-
-        if (ahora - datetime.fromisoformat(join_date)).days < nuevo_dias:
-            continue
-
-        if (ahora - datetime.fromisoformat(last_activity)).days >= inactivo_dias:
-            await context.bot.send_message(
-                chat.id,
-                f"⚠️ <a href='tg://user?id={user_id}'>Usuario</a> inactivo {inactivo_dias} días.",
-                parse_mode="HTML"
-            )
-            avisados += 1
-
-    await update.message.reply_text(f"Revisión terminada. Avisos enviados: {avisados}")
-
-
-async def set_inactivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dias = int(context.args[0])
-    chat_id = update.effective_chat.id
-
-    _, nuevo = obtener_config(chat_id)
+    if chat.type not in ["group", "supergroup"]:
+        return
 
     cur.execute("""
-    INSERT INTO config (chat_id, inactive_days, new_user_days)
-    VALUES (?, ?, ?)
-    ON CONFLICT(chat_id)
-    DO UPDATE SET inactive_days=?
-    """, (chat_id, dias, nuevo, dias))
+    INSERT INTO users (chat_id, user_id, last_activity, joined_at, warned)
+    VALUES (?, ?, ?, ?, 0)
+    ON CONFLICT(chat_id, user_id)
+    DO UPDATE SET last_activity=excluded.last_activity
+    """, (chat.id, user.id, now().isoformat(), now().isoformat()))
+    conn.commit()
 
-    db.commit()
-    await update.message.reply_text(f"Inactividad configurada a {dias} días")
+# ---------- CHECK INACTIVES ----------
+async def check_inactives(context: ContextTypes.DEFAULT_TYPE):
+    limit = now() - timedelta(days=INACTIVITY_DAYS)
+    grace = now() - timedelta(days=NEW_USER_GRACE_DAYS)
 
+    cur.execute("SELECT chat_id, user_id, last_activity, joined_at, warned FROM users")
+    rows = cur.fetchall()
 
-async def set_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dias = int(context.args[0])
-    chat_id = update.effective_chat.id
+    for chat_id, user_id, last_activity, joined_at, warned in rows:
+        if warned:
+            continue
 
-    inactivo, _ = obtener_config(chat_id)
+        if datetime.fromisoformat(joined_at) > grace:
+            continue
+
+        if datetime.fromisoformat(last_activity) < limit:
+            try:
+                member = await context.bot.get_chat_member(chat_id, user_id)
+                if member.status in ["administrator", "creator"]:
+                    continue
+
+                # Aviso privado
+                await context.bot.send_message(
+                    user_id,
+                    f"⚠️ Hola, llevas {INACTIVITY_DAYS} días sin participar en el grupo."
+                )
+
+                # Aviso en grupo
+                await context.bot.send_message(
+                    chat_id,
+                    f"⚠️ Usuario inactivo detectado: <a href='tg://user?id={user_id}'>usuario</a>",
+                    parse_mode="HTML"
+                )
+
+                # Marcar como avisado
+                cur.execute("""
+                UPDATE users SET warned=1
+                WHERE chat_id=? AND user_id=?
+                """, (chat_id, user_id))
+                conn.commit()
+
+            except:
+                pass
+
+# ---------- COMMANDS ----------
+async def inactive_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    member = await chat.get_member(update.effective_user.id)
+
+    if member.status not in ["administrator", "creator"]:
+        return
+
+    limit = now() - timedelta(days=INACTIVITY_DAYS)
 
     cur.execute("""
-    INSERT INTO config (chat_id, inactive_days, new_user_days)
-    VALUES (?, ?, ?)
-    ON CONFLICT(chat_id)
-    DO UPDATE SET new_user_days=?
-    """, (chat_id, inactivo, dias, dias))
+    SELECT user_id FROM users
+    WHERE chat_id=? AND last_activity < ?
+    """, (chat.id, limit.isoformat()))
 
-    db.commit()
-    await update.message.reply_text(f"Usuarios nuevos excluidos {dias} días")
+    users = cur.fetchall()
 
+    if not users:
+        await update.message.reply_text("✅ No hay usuarios inactivos.")
+        return
 
-# ===== MAIN =====
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    text = "📋 Usuarios inactivos:\n"
+    for (uid,) in users:
+        text += f"• <a href='tg://user?id={uid}'>usuario</a>\n"
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registrar_actividad))
-    app.add_handler(CommandHandler("revisar", revisar))
-    app.add_handler(CommandHandler("set_inactivo", set_inactivo))
-    app.add_handler(CommandHandler("set_nuevo", set_nuevo))
+    await update.message.reply_text(text, parse_mode="HTML")
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TOKEN,
-        webhook_url=f"{APP_URL}/{TOKEN}"
-    )
+# ---------- APP ----------
+app = ApplicationBuilder().token(TOKEN).build()
 
+app.add_handler(MessageHandler(filters.ALL, register_activity))
+app.add_handler(CommandHandler("inactivos", inactive_list))
 
-if __name__ == "__main__":
-    main()
+app.job_queue.run_repeating(check_inactives, interval=86400, first=10)
+
+print("Bot de inactivos activo")
+app.run_polling()
