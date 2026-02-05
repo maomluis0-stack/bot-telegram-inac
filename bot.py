@@ -11,7 +11,9 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = os.environ.get("8509975594:AAGpgppX7aAzuSYIug0udL3MZmuYyNhGS20")
+TOKEN = os.environ.get("BOT_TOKEN")
+print("TOKEN RECIBIDO:", repr(TOKEN))
+
 
 DB_FILE = "users.db"
 INACTIVITY_DAYS = 14
@@ -148,3 +150,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
